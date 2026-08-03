@@ -91,6 +91,7 @@ class DLOLabProvider(TrajectoryProvider):
         table_z: float = 0.006,
         contact_radius: float | None = None,
         stretch_stiffness: float | None = None,
+        tension_scale: float = 1000.0,
         contact_mode: str = "self",
         n_topo_classes: int = 3,
         device: str = "cpu",
@@ -118,8 +119,11 @@ class DLOLabProvider(TrajectoryProvider):
         # 自接触判定距离：默认 3*segment_radius。两股叠放时中心距≈2*radius(直径)，
         # 取 3*radius 留余量，才检得到"压在另一股上"的接触。
         self.contact_radius = 3.0 * segment_radius if contact_radius is None else contact_radius
-        # 张力代理刚度：默认用拉伸刚度 K，使量纲为力 ~ K*应变
+        # 张力代理刚度：默认用拉伸刚度 K，使原始量纲为力 ~ K*应变
         self.stretch_stiffness = K if stretch_stiffness is None else stretch_stiffness
+        # 张力归一化尺度：把物理张力(~O(1000))除以它归一到 O(1)，使各 head 损失量级可比。
+        # 物理张力 = 存储张力 * tension_scale（可逆，便于还原）。
+        self.tension_scale = tension_scale
         # contact_mode: "self"=只算绳子自接触（与 contact_pairs 边一致，推荐）；
         #               "all"=自接触 ∪ 落地/外物碰撞（collided）
         self.contact_mode = contact_mode
@@ -211,7 +215,7 @@ class DLOLabProvider(TrajectoryProvider):
         length = plain(st.length[0]).float()  # [E]
         collided = plain(st.collided[0]).bool()  # [N]
 
-        tension = self._edge_strain_to_node_tension(length).float()
+        tension = (self._edge_strain_to_node_tension(length) / self.tension_scale).float()
         pairs, geo_contact = self._self_contacts(pos)
         if self.contact_mode == "all":
             contact = (collided | geo_contact.bool()).float()

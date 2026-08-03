@@ -35,11 +35,10 @@ def main():
         "traj_len": 18,               # 与生成时 T 一致
         "traj_per_epoch": len(provider._trajs),  # 每 epoch 过一遍数据量
         "dt": 0.12,                   # 真实 macro-step = steps_interval(120)*1e-3
-        "tension_limit": 1500.0,      # DLO-Lab 张力尺度（~0..2500）下的 failure 阈值
+        "tension_limit": 1.5,         # 张力已归一化(physical/1000)，failure 阈值同步归一(=1500/1000)
         "epochs": args.epochs,
-        # 各 head 损失量级差异大（tension ~1000、pos ~0.01），重设权重使其可比，
-        # 避免 tension 主导梯度。
-        "weights": {"pos": 5.0, "tension": 1e-3, "contact": 0.5, "topo": 0.3, "fail": 0.2},
+        # tension 已归一化到 O(1)，各 head 损失量级可比，权重回到正常值。
+        "weights": {"pos": 5.0, "tension": 0.5, "contact": 0.5, "topo": 0.3, "fail": 0.2},
     })
     print("config:", json.dumps({k: cfg[k] for k in
           ["num_nodes","contact_radius","traj_len","traj_per_epoch","dt","tension_limit","epochs"]}, ensure_ascii=False))
