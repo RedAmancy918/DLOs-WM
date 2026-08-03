@@ -35,8 +35,21 @@ from __future__ import annotations
 import math
 import torch
 
-from .schema import DLOState, DLOAction
+from .schema import (
+    DLOAction,
+    DLOEpisode,
+    DLOState,
+    MaterialCondition,
+    infer_self_contact_pairs,
+    node_contact_from_edges,
+)
 from .dataset import TrajectoryProvider
+from .material_sampling import (
+    MaterialParameters,
+    MaterialRandomizationConfig,
+    counterfactual_material_sweep,
+    sample_material_parameters,
+)
 
 
 class DLOLabProvider(TrajectoryProvider):
@@ -80,6 +93,8 @@ class DLOLabProvider(TrajectoryProvider):
         K: float = 5e4,
         E: float = 1e5,
         G: float = 1e4,
+        mu_self_static: float = 0.3,
+        mu_self_kinetic: float = 0.25,
         use_inextensible: bool = False,
         anchor_ids: list[int] | None = None,
         n_grasp: int = 2,
@@ -96,6 +111,7 @@ class DLOLabProvider(TrajectoryProvider):
         n_topo_classes: int = 3,
         device: str = "cpu",
         seed: int = 0,
+        material_randomization: MaterialRandomizationConfig | None = None,
     ):
         self._n = num_nodes
         self.interval = interval
@@ -104,6 +120,8 @@ class DLOLabProvider(TrajectoryProvider):
         self.K = K                       # 拉伸刚度（>0 且 use_inextensible=False 才能伸长，张力才有信号）
         self.E = E                       # 弯曲刚度
         self.G = G                       # 扭转刚度
+        self.mu_self_static = mu_self_static
+        self.mu_self_kinetic = mu_self_kinetic
         self.use_inextensible = use_inextensible
         self.anchor_ids = [0, 1] if anchor_ids is None else list(anchor_ids)
         self.n_grasp = n_grasp
@@ -118,6 +136,7 @@ class DLOLabProvider(TrajectoryProvider):
         self.table_z = table_z                 # 桌面高度（落点 z）
         # 自接触判定距离：默认 3*segment_radius。两股叠放时中心距≈2*radius(直径)，
         # 取 3*radius 留余量，才检得到"压在另一股上"的接触。
+        self._contact_radius_override = contact_radius
         self.contact_radius = 3.0 * segment_radius if contact_radius is None else contact_radius
         # 张力代理刚度：默认用拉伸刚度 K，使原始量纲为力 ~ K*应变
         self.stretch_stiffness = K if stretch_stiffness is None else stretch_stiffness
@@ -129,11 +148,24 @@ class DLOLabProvider(TrajectoryProvider):
         self.contact_mode = contact_mode
         self.n_topo_classes = n_topo_classes
         self.device = device
-        self.g = torch.Generator().manual_seed(seed)
+        self.seed = seed
+        self.g = torch.Generator(device="cpu").manual_seed(seed)
+        self.material_randomization = material_randomization
+        if (
+            self.use_inextensible
+            and material_randomization is not None
+            and material_randomization.K_scale != (1.0, 1.0)
+        ):
+            raise ValueError(
+                "use_inextensible=True 时 K 被约束屏蔽，不能随机化 K"
+            )
+        self._episode_index = 0
 
         self._scene = None
         self._rope = None
         self._rest_len = None  # [E] 初始段长，作 tension 的应变基准
+        self._init_pos = None
+        self._active_material: MaterialParameters | None = None
 
     @property
     def num_nodes(self) -> int:
@@ -163,6 +195,8 @@ class DLOLabProvider(TrajectoryProvider):
                 segment_radius=self.segment_radius,
                 segment_mass=self.segment_mass,
                 K=self.K, E=self.E, G=self.G,
+                static_friction=self.mu_self_static,
+                kinetic_friction=self.mu_self_kinetic,
                 use_inextensible=self.use_inextensible,
             ),
             morph=gs.morphs.ParameterizedRod(
@@ -188,18 +222,118 @@ class DLOLabProvider(TrajectoryProvider):
         self._rest_len = st0.length[0].detach().to(self.device).as_subclass(torch.Tensor).float().clone()  # [E] f32
         # 初始（直线、未受力）位形，供批量生成时 _reset() 复位
         self._init_pos = st0.pos[0].detach().to(self.device).as_subclass(torch.Tensor).float().clone()  # [N,3]
+        # DLO-Lab 的 ``segment_mass`` 实际定义在 N 个顶点，而自然长度定义在 N-1 条边。
+        # 因此线密度必须用总顶点质量 / 总自然长度，不能做逐元素相除。
+        base_density = (
+            self._n * self.segment_mass / float(self._rest_len.sum())
+        )
+        self._active_material = MaterialParameters(
+            K=self.K,
+            E=self.E,
+            G=self.G,
+            linear_density=base_density,
+            radius=self.segment_radius,
+            mu_self_static=self.mu_self_static,
+            mu_self_kinetic=self.mu_self_kinetic,
+        )
         # 让绳子先在重力下稳定几步再开始采样
         for _ in range(self.steps_interval):
             scene.step()
 
-    def _reset(self):
-        """把绳子复位到初始直线 + 零速 + 重新铺到桌面，使每条轨迹相互独立。"""
+    def _reset(
+        self,
+        settle_steps: int | None = None,
+        material: MaterialParameters | None = None,
+    ) -> MaterialCondition | None:
+        """完整复位 solver 隐状态，再设置本 episode 材料并选择是否沉降。"""
+        # 只改 pos/vel 会遗留 theta/omega/twist 等 rod 隐状态，反事实组会因此
+        # 不再真正共享初始条件。官方 DLO-Lab system-id 路径也是 reset 后再 setter。
+        self._scene.reset()
         self._rope.set_position(self._init_pos)
         self._rope.set_velocity(torch.zeros(self._n, 3, device="cpu"))
         if self.anchor_ids:
             self._rope.set_fixed_states(fixed_ids=self.anchor_ids)
-        for _ in range(self.steps_interval):
+        condition = (
+            None if material is None else self._apply_material(material)
+        )
+        if settle_steps is None:
+            settle_steps = self.steps_interval
+        if settle_steps < 0:
+            raise ValueError("settle_steps 必须大于等于 0")
+        for _ in range(settle_steps):
             self._scene.step()
+        return condition
+
+    def _base_material_parameters(self) -> MaterialParameters:
+        """返回按 solver 自然长度换算后的基准材料参数。"""
+        if self._rest_len is None:
+            raise RuntimeError("scene 尚未 build，无法确定真实自然长度")
+        return MaterialParameters(
+            K=self.K,
+            E=self.E,
+            G=self.G,
+            linear_density=(
+                self._n * self.segment_mass / float(self._rest_len.sum())
+            ),
+            radius=self.segment_radius,
+            mu_self_static=self.mu_self_static,
+            mu_self_kinetic=self.mu_self_kinetic,
+        )
+
+    def _apply_material(self, material: MaterialParameters) -> MaterialCondition:
+        """通过 DLO-Lab 的公开 setter 更新底层 solver，并返回实际 episode 条件。
+
+        这些 setter 直接调用 solver kernel；因此只改变均匀材料参数时无需重建
+        Genesis scene。若未来随机化节点数、自然形状或环境几何，则仍须重建。
+        """
+        if self._rope is None or self._rest_len is None:
+            raise RuntimeError("必须先 build scene 再设置材料")
+        scalar = lambda value: torch.tensor([value], dtype=torch.float32)
+        total_mass = material.linear_density * float(self._rest_len.sum())
+        node_mass = torch.full(
+            (1, self._n), total_mass / self._n, dtype=torch.float32
+        )
+        node_radius = torch.full(
+            (1, self._n), material.radius, dtype=torch.float32
+        )
+        mu_s = torch.full(
+            (1, self._n), material.mu_self_static, dtype=torch.float32
+        )
+        mu_k = torch.full(
+            (1, self._n), material.mu_self_kinetic, dtype=torch.float32
+        )
+
+        self._rope.set_stretching_stiffness(scalar(material.K))
+        self._rope.set_bending_stiffness(scalar(material.E))
+        self._rope.set_twisting_stiffness(scalar(material.G))
+        self._rope.set_segment_mass(node_mass)
+        self._rope.set_segment_radius(node_radius)
+        self._rope.set_mu_s(mu_s)
+        self._rope.set_mu_k(mu_k)
+
+        self._active_material = material
+        # 张力是 K*应变的派生监督，材料改变时必须同步使用当前 K。
+        self.stretch_stiffness = material.K
+        if self._contact_radius_override is None:
+            self.contact_radius = 3.0 * material.radius
+
+        device = self._rest_len.device
+        dtype = self._rest_len.dtype
+        condition = MaterialCondition(
+            rest_length=self._rest_len.clone(),
+            node_mass=node_mass[0].to(device=device, dtype=dtype),
+            node_radius=node_radius[0].to(device=device, dtype=dtype),
+            K=torch.tensor(material.K, device=device, dtype=dtype),
+            E=torch.tensor(material.E, device=device, dtype=dtype),
+            G=torch.tensor(material.G, device=device, dtype=dtype),
+            mu_self_static=torch.tensor(
+                material.mu_self_static, device=device, dtype=dtype
+            ),
+            mu_self_kinetic=torch.tensor(
+                material.mu_self_kinetic, device=device, dtype=dtype
+            ),
+        )
+        return condition.validate(num_nodes=self._n)
 
     # ------------------------------------------------------------------
     # 状态读取 + 派生量
@@ -243,19 +377,42 @@ class DLOLabProvider(TrajectoryProvider):
     def _self_contacts(self, pos: torch.Tensor):
         """非相邻顶点几何邻近对（自接触）。返回 pairs[K,2] 与 per-node 0/1。
         口径与 SyntheticRope / WM rollout 的 edge_builder_from_contacts 一致。"""
-        n = self._n
-        d = torch.cdist(pos, pos)                                  # [N,N]
-        idx = torch.arange(n, device=self.device)
-        # 按弧长排除近邻：沿绳间距 < contact_radius 的点对（|i-j|*interval 太近）天然靠近，
-        # 不算自接触，否则会把同一段绳的邻点误判为接触。
-        band_k = max(1, int(math.ceil(self.contact_radius / self.interval)))
-        band = (idx.unsqueeze(0) - idx.unsqueeze(1)).abs() <= band_k
-        mask = (d < self.contact_radius) & (~band)
-        pairs = torch.nonzero(torch.triu(mask), as_tuple=False)    # [K,2]
-        node_contact = torch.zeros(n, device=self.device)
+        if self._rest_len is None:
+            raise RuntimeError("scene 尚未 build，缺少真实 rest_length")
+        radius_value = (
+            self._active_material.radius
+            if self._active_material is not None
+            else self.segment_radius
+        )
+        node_radius = torch.full(
+            (self._n,), radius_value, device=pos.device, dtype=pos.dtype
+        )
+        pairs = infer_self_contact_pairs(
+            pos,
+            node_radius,
+            self._rest_len,
+            contact_margin_scale=0.5,
+            distance_threshold=self._contact_radius_override,
+        )
+        # 复用图侧同一派生逻辑；先构造仅含 contact pairs 的双向索引。
         if len(pairs) > 0:
-            node_contact[pairs[:, 0]] = 1.0
-            node_contact[pairs[:, 1]] = 1.0
+            contact_edge_index = torch.cat(
+                [pairs.t(), pairs[:, [1, 0]].t()], dim=1
+            )
+            contact_flags = torch.ones(
+                contact_edge_index.shape[1], device=pos.device
+            )
+        else:
+            contact_edge_index = torch.empty(
+                (2, 0), dtype=torch.long, device=pos.device
+            )
+            contact_flags = torch.empty(0, device=pos.device)
+        node_contact = node_contact_from_edges(
+            self._n,
+            contact_edge_index,
+            contact_flags,
+            dtype=pos.dtype,
+        )
         return pairs.to(self.device), node_contact
 
     def _crossing_number(self, pos: torch.Tensor) -> int:
@@ -281,32 +438,83 @@ class DLOLabProvider(TrajectoryProvider):
         """伺服抓取顶点跟随位移：每个子步重设抓取端速度（_tgt['vel'] 是一次性的，
         必须逐步重设），其余顶点保持真实动力学。这样抓取端才会真正拽动绳子。"""
         dt = 1e-3
-        v_cmd = action.delta / (self.steps_interval * dt)  # [G,3]
-        idx = action.grasp_idx
+        action.validate(num_nodes=self._n)
+        active = action._active_mask(action.grasp_idx.device)
+        v_cmd = action.delta[active] / (self.steps_interval * dt)  # [G_active,3]
+        idx = action.grasp_idx[active]
         for _ in range(self.steps_interval):
             vel = self._rope.get_state().vel[0].detach().clone()  # [N,3] 当前真实速度
             j = idx.to(vel.device)
-            vel[j] = v_cmd.to(vel.dtype).to(vel.device)
+            if len(j) > 0:
+                vel[j] = v_cmd.to(vel.dtype).to(vel.device)
             self._rope.set_velocity(vel)
             self._scene.step()
 
-    def _sample_action(self) -> DLOAction:
+    def _make_action(
+        self,
+        grasp_idx: torch.Tensor,
+        delta: torch.Tensor,
+        current_pos: torch.Tensor,
+        target_pos: torch.Tensor | None = None,
+    ) -> DLOAction:
+        """创建完整控制记录，同时保持旧 ``delta`` 驱动接口可用。"""
+        grasp_idx = grasp_idx.to(device=self.device, dtype=torch.long)
+        delta = delta.to(device=self.device, dtype=torch.float32)
+        if target_pos is None:
+            target_pos = current_pos[grasp_idx] + delta
+        macro_dt = self.steps_interval * 1e-3
+        return DLOAction(
+            grasp_idx=grasp_idx,
+            delta=delta,
+            gripper_id=torch.arange(
+                len(grasp_idx), dtype=torch.long, device=self.device
+            ),
+            target_pos=target_pos.to(self.device).float(),
+            target_vel=delta / macro_dt,
+            grasp_active=torch.ones(
+                len(grasp_idx), dtype=torch.bool, device=self.device
+            ),
+            duration=torch.tensor(
+                macro_dt, dtype=torch.float32, device=self.device
+            ),
+        ).validate(num_nodes=self._n)
+
+    def _sample_action(
+        self,
+        current_pos: torch.Tensor,
+        generator: torch.Generator,
+    ) -> DLOAction:
         # 在非锚定顶点里随机选 G 个抓手，各给一个随机小位移
         candidates = [i for i in range(self._n) if i not in self.anchor_ids]
         # genesis 把 torch 默认设备设成 cuda；我们的 generator 在 cpu，故显式 device="cpu"
-        perm = torch.randperm(len(candidates), generator=self.g, device="cpu")[: self.n_grasp]
+        perm = torch.randperm(
+            len(candidates), generator=generator, device="cpu"
+        )[: self.n_grasp]
         grasp = torch.tensor([candidates[i] for i in perm.tolist()],
                              dtype=torch.long, device=self.device)
-        delta = (self.max_disp * torch.randn(self.n_grasp, 3, generator=self.g, device="cpu")).to(self.device).float()
-        return DLOAction(grasp_idx=grasp, delta=delta)
+        delta = (
+            self.max_disp
+            * torch.randn(
+                self.n_grasp, 3, generator=generator, device="cpu"
+            )
+        ).to(self.device).float()
+        return self._make_action(grasp, delta, current_pos)
 
-    def _plan_motion(self, state0, T: int):
+    def _plan_motion(
+        self,
+        reference_pos: torch.Tensor,
+        T: int,
+        generator: torch.Generator,
+    ):
         """规划自由端的折叠/缠绕路点，制造自接触与拓扑变化。
-        返回 (grasp_idx:int, waypoints:[T,3] cpu)。抓自由端（末顶点 N-1，锚在头部）。"""
-        pos = state0.pos.float().cpu()           # [N,3] cpu
+        返回 (grasp_idx:int, waypoints:[T,3] cpu)。路点以未受力的 canonical
+        位形定义，从而不同材料的 paired episode 接收到相同绝对控制目标。
+        """
+        pos = reference_pos.float().cpu()        # [N,3] cpu
         gidx = self._n - 1
         start = pos[gidx].clone()
-        anchor = pos[self.anchor_ids[0]].clone()
+        anchor_idx = self.anchor_ids[0] if self.anchor_ids else 0
+        anchor = pos[anchor_idx].clone()
         wps = torch.zeros(T, 3, device="cpu")
 
         if self.motion == "fold":
@@ -322,9 +530,15 @@ class DLOLabProvider(TrajectoryProvider):
         elif self.motion == "loop":
             # 自由端在 xy 平面内绕一圈成环（产生交叉）。每条轨迹随机化半径/方向/抬起，增加多样性。
             body = start - anchor
-            rand = lambda a, b: a + (b - a) * float(torch.rand(1, generator=self.g, device="cpu"))
+            rand = lambda a, b: a + (b - a) * float(
+                torch.rand(1, generator=generator, device="cpu")
+            )
             R = rand(0.25, 0.45) * body[:2].norm().clamp(min=1e-3)
-            sign = 1.0 if torch.rand(1, generator=self.g, device="cpu") > 0.5 else -1.0
+            sign = (
+                1.0
+                if torch.rand(1, generator=generator, device="cpu") > 0.5
+                else -1.0
+            )
             lift = rand(0.009, 0.014)
             bx = body / (body.norm() + 1e-8)                 # 绳方向（近 x）
             perp = sign * torch.tensor([-bx[1], bx[0], 0.0], device="cpu")  # xy 平面内垂直方向
@@ -343,29 +557,94 @@ class DLOLabProvider(TrajectoryProvider):
     # ------------------------------------------------------------------
     # 对外接口
     # ------------------------------------------------------------------
-    def sample_trajectory(self, T: int = 20):
+    def _resolve_material(
+        self,
+        material: MaterialParameters | None,
+        generator: torch.Generator,
+    ) -> MaterialParameters:
+        if material is not None:
+            return material
+        base = self._base_material_parameters()
+        if self.material_randomization is None:
+            return base
+        if (
+            self.use_inextensible
+            and self.material_randomization.K_scale != (1.0, 1.0)
+        ):
+            raise ValueError(
+                "use_inextensible=True 时 K 被约束屏蔽，不能随机化 K"
+            )
+        return sample_material_parameters(
+            base, self.material_randomization, generator
+        )
+
+    def sample_episode(
+        self,
+        T: int = 20,
+        *,
+        material: MaterialParameters | None = None,
+        episode_id: str | None = None,
+        seed: int | None = None,
+        action_seed: int | None = None,
+        settle_steps: int | None = None,
+        metadata: dict | None = None,
+    ) -> DLOEpisode:
+        """生成一个材料条件化 episode。
+
+        ``seed`` 控制材料采样，``action_seed`` 独立控制动作/路点。反事实组给
+        多个 episode 传相同 ``action_seed`` 和 ``settle_steps=0``，即可保证
+        初始位形与绝对抓手目标一致，只改变材料条件。
+        """
+        if T <= 0:
+            raise ValueError("T 必须大于 0")
         if self._scene is None:
             self._build_scene()
-        else:
-            self._reset()   # 每条轨迹复位，保证相互独立
+
+        episode_seed = (
+            self.seed + self._episode_index if seed is None else seed
+        )
+        control_seed = (
+            episode_seed + 1_000_003 if action_seed is None else action_seed
+        )
+        material_generator = torch.Generator(device="cpu").manual_seed(
+            episode_seed
+        )
+        action_generator = torch.Generator(device="cpu").manual_seed(
+            control_seed
+        )
+
+        params = self._resolve_material(material, material_generator)
+        condition = self._reset(
+            settle_steps=settle_steps, material=params
+        )
+        assert condition is not None
 
         state0, pairs0 = self._read_state()
         states = [state0]
         contact_pairs = [pairs0]
         actions = []
 
-        plan = None if self.motion == "random" else self._plan_motion(state0, T)
+        plan = (
+            None
+            if self.motion == "random"
+            else self._plan_motion(self._init_pos, T, action_generator)
+        )
 
         for t in range(T):
             if plan is None:
-                action = self._sample_action()
+                action = self._sample_action(
+                    states[-1].pos, action_generator
+                )
             else:
-                gidx, wps = plan
-                cur = states[-1].pos[gidx]              # [3] cpu，当前抓取点
-                delta = (wps[t] - cur).unsqueeze(0)     # [1,3] 伺服到路点
-                action = DLOAction(
-                    grasp_idx=torch.tensor([gidx], device=self.device),
-                    delta=delta.to(self.device).float(),
+                gidx, waypoints = plan
+                cur = states[-1].pos[gidx]
+                target = waypoints[t].to(self.device)
+                delta = (target - cur).unsqueeze(0)
+                action = self._make_action(
+                    torch.tensor([gidx], device=self.device),
+                    delta,
+                    states[-1].pos,
+                    target_pos=target.unsqueeze(0),
                 )
             self._apply_action(action)
             state, pairs = self._read_state()
@@ -373,7 +652,83 @@ class DLOLabProvider(TrajectoryProvider):
             states.append(state)
             contact_pairs.append(pairs)
 
-        return states, actions, contact_pairs
+        if episode_id is None:
+            episode_id = f"{self.motion}-{episode_seed:08d}"
+        episode_metadata = {
+            "provider": "DLOLabProvider",
+            "control_seed": control_seed,
+            "settle_steps": (
+                self.steps_interval if settle_steps is None else settle_steps
+            ),
+            "material_parameters": params.to_dict(),
+            "use_inextensible": self.use_inextensible,
+            "steps_interval": self.steps_interval,
+            "tension_scale": self.tension_scale,
+            "contact_mode": self.contact_mode,
+            "contact_margin_scale": 0.5,
+            "contact_distance_threshold": self._contact_radius_override,
+        }
+        if metadata:
+            episode_metadata.update(metadata)
+        episode = DLOEpisode(
+            material=condition,
+            states=states,
+            actions=actions,
+            contact_pairs=contact_pairs,
+            macro_dt=self.steps_interval * 1e-3,
+            task=self.motion,
+            seed=episode_seed,
+            id=episode_id,
+            metadata=episode_metadata,
+        ).validate()
+        self._episode_index += 1
+        return episode
+
+    def sample_counterfactual_group(
+        self,
+        T: int,
+        parameter: str,
+        scales: list[float] | tuple[float, ...],
+        *,
+        seed: int,
+        group_id: str | None = None,
+        base_material: MaterialParameters | None = None,
+    ) -> list[DLOEpisode]:
+        """生成只改变一个材料量的 paired counterfactual episode 组。"""
+        if self.use_inextensible and parameter == "K":
+            raise ValueError(
+                "use_inextensible=True 时 K 反事实没有可辨识物理效应"
+            )
+        if self._scene is None:
+            self._build_scene()
+        base = base_material or self._base_material_parameters()
+        materials = counterfactual_material_sweep(
+            base, parameter, scales
+        )
+        group_id = group_id or f"cf-{parameter}-{seed:08d}"
+        control_seed = seed + 2_000_003
+        episodes = []
+        for index, (scale, varied) in enumerate(zip(scales, materials)):
+            episodes.append(self.sample_episode(
+                T=T,
+                material=varied,
+                episode_id=f"{group_id}-{index:02d}",
+                seed=seed,
+                action_seed=control_seed,
+                # 不做材料相关沉降，保证组内 state_0 的完整动力学状态一致。
+                settle_steps=0,
+                metadata={
+                    "counterfactual_group_id": group_id,
+                    "counterfactual_parameter": parameter,
+                    "counterfactual_scale": float(scale),
+                },
+            ))
+        return episodes
+
+    def sample_trajectory(self, T: int = 20):
+        """旧三元组接口；内部仍走 v2 episode，保证两条路径物理一致。"""
+        episode = self.sample_episode(T=T)
+        return episode.states, episode.actions, episode.contact_pairs
 
 
 def _seg_intersect(p1, p2, p3, p4) -> bool:

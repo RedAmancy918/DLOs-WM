@@ -33,7 +33,7 @@ def main():
         "num_nodes": provider.num_nodes,
         "contact_radius": 0.015,      # = 3*segment_radius，与 provider 自接触口径一致
         "traj_len": 18,               # 与生成时 T 一致
-        "traj_per_epoch": len(provider._trajs),  # 每 epoch 过一遍数据量
+        "traj_per_epoch": provider.num_episodes,  # v1/v2 都按 episode 计数
         "dt": 0.12,                   # 真实 macro-step = steps_interval(120)*1e-3
         "tension_limit": 1.5,         # 张力已归一化(physical/1000)，failure 阈值同步归一(=1500/1000)
         "epochs": args.epochs,

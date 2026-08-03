@@ -14,7 +14,11 @@
 from __future__ import annotations
 import torch
 
-from ..data.schema import build_edges
+from ..data.schema import (
+    MaterialCondition,
+    build_edges,
+    infer_self_contact_pairs,
+)
 from ..data.dataset import make_transition_batch
 from .losses import world_model_loss
 
@@ -26,11 +30,44 @@ def edge_builder_from_contacts(num_nodes, contact_radius=0.04):
         # 距离推断接触对（与玩具生成器同口径）
         n = pos.shape[0]
         d = (pos.unsqueeze(0) - pos.unsqueeze(1)).norm(dim=-1)
-        idx = torch.arange(n)
+        idx = torch.arange(n, device=pos.device)
         band = (torch.abs(idx.unsqueeze(0) - idx.unsqueeze(1)) <= 1)
         mask = (d < contact_radius) & (~band)
         pairs = torch.nonzero(torch.triu(mask), as_tuple=False)
         return build_edges(n, pairs if len(pairs) else None, device=pos.device)
+    return _builder
+
+
+def edge_builder_from_material(
+    material: MaterialCondition,
+    contact_margin_scale: float = 0.5,
+):
+    """基于当前 ``pos`` 和 episode 材料半径动态重建自接触边。
+
+    接触判据使用 centerline gap：``d_ij - (r_i+r_j)``。额外 margin
+    按半径和缩放；默认均匀半径时阈值为 ``3r``，与 DLO-Lab provider
+    的历史标注口径一致。材料属于 episode 条件，但几何距离每步重算。
+    """
+    if contact_margin_scale < 0:
+        raise ValueError("contact_margin_scale 必须大于等于 0")
+    material.validate()
+
+    def _builder(pos):
+        n = pos.shape[0]
+        if n != material.num_nodes:
+            raise ValueError(
+                f"pos 节点数 {n} 与材料节点数 {material.num_nodes} 不一致"
+            )
+        pairs = infer_self_contact_pairs(
+            pos,
+            material.node_radius,
+            material.rest_length,
+            contact_margin_scale=contact_margin_scale,
+        )
+        return build_edges(
+            n, pairs if len(pairs) else None, device=pos.device
+        )
+
     return _builder
 
 

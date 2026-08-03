@@ -37,6 +37,34 @@ python scripts/run.py
 > 注意：`SyntheticRope` 只是自洽的玩具动力学，用来打通管线、对齐维度、抓 bug。
 > **不是真实物理，不可当真。**
 
+## Workshop：材料条件化闭环管线
+
+当前 v2 管线把 `K/E/G`、线密度、半径和自摩擦作为 episode-level
+`MaterialCondition`，支持 DLO-Lab 数据生成、材料条件化模型、同容量零条件
+baseline、旧 GNN baseline，以及 ID/OOD/paired-counterfactual 评测。
+
+`DLOState` 只保存真正的动态状态。自接触边和节点 contact 会在 rollout 每一步按
+当前预测位置重新派生；SDF 尚未纳入本阶段模型，也不会作为可递推状态缓存。
+
+```bash
+# 小规模闭环验证；正式实验数量见 docs/workshop_milestone.md
+python scripts/gen_material_dataset.py --out-dir runs/workshop_data
+python scripts/run_material.py \
+  --data runs/workshop_data/train.pt \
+  --out runs/workshop_material.pt
+python scripts/eval_material.py \
+  --checkpoint runs/workshop_material.pt \
+  --id-data runs/workshop_data/test_id.pt \
+  --ood-data runs/workshop_data/test_ood_material.pt \
+  --counterfactual-data runs/workshop_data/counterfactual.pt
+```
+
+训练和评测入口会校验同目录 `manifest.json` 的 SHA256、生成源码/动作协议契约、
+`macro_dt` 和接触构图规则；材料 shuffle 的实际置换也会写入评测 JSON。完整的
+训练入口默认读取 `train.pt` 同目录的 `val.pt`，按闭环 position NRMSE 选回最佳
+epoch，并以 patience 10 early-stop。冻结协议、必跑消融和 go/no-go 标准见
+[`docs/workshop_milestone.md`](docs/workshop_milestone.md)。
+
 ## 接入你自己的仿真数据（核心）
 
 只需实现一个 `TrajectoryProvider`（见 `dlo_wm/data/dataset.py`）：
@@ -72,12 +100,14 @@ class MyIsaacRope(TrajectoryProvider):
 ## 目录
 ```
 dlo_wm/
-  data/schema.py     张量约定 / 图构造 / 边特征   ← 先读这个
-  data/dataset.py    TrajectoryProvider 接口 + 玩具生成器
-  model/gnn.py       手写 message passing GNN + 多 head + rollout
+  data/schema.py       状态 / 动作 / 材料 schema 与派生图特征
+  data/dataset.py      TrajectoryProvider 接口 + 玩具生成器
+  data/provenance.py   数据 SHA256 与生成协议契约
+  model/gnn.py         GNN、材料条件编码与闭环 rollout
   train/losses.py    多 head 损失 + failure label 派生
-  train/trainer.py   训练循环（含 pushforward）
-  eval/rollout.py    多步 rollout 评估
-configs/default.py   超参 / 权重 / failure 规则
-scripts/run.py       入口
+  train/material_trainer.py  单步 + differentiable closed-loop 训练
+  eval/material_rollout.py   ID/OOD/paired-CF 指标
+scripts/gen_material_dataset.py  DLO-Lab v2 数据生成
+scripts/run_material.py          workshop 训练入口
+scripts/eval_material.py         workshop 评测入口
 ```

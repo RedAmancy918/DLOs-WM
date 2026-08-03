@@ -19,9 +19,11 @@
 
 from __future__ import annotations
 from abc import ABC, abstractmethod
+from dataclasses import replace
+from typing import Iterable
 import torch
 
-from .schema import DLOState, DLOAction, build_edges
+from .schema import DLOAction, DLOEpisode, DLOState, MaterialCondition
 
 
 class TrajectoryProvider(ABC):
@@ -42,6 +44,51 @@ class TrajectoryProvider(ABC):
             contact_pairs: list[Tensor]  长度 T+1，每个 [K_t, 2]（可空）
         """
         raise NotImplementedError
+
+    def sample_episode(
+        self,
+        T: int | None = None,
+        *,
+        material: MaterialCondition | None = None,
+        macro_dt: float | None = None,
+        task: str = "",
+        seed: int = 0,
+        episode_id: str = "",
+        metadata: dict | None = None,
+    ) -> DLOEpisode:
+        """把旧式轨迹适配为 v2 episode。
+
+        旧 provider 本身不记录材料，因此调用者必须显式传入
+        ``material``；原生 v2 provider 应覆盖本方法，直接返回
+        仿真时实际使用的材料参数。
+        """
+        if material is None:
+            raise NotImplementedError(
+                "该 provider 只提供旧式 trajectory，无法推断材料条件；"
+                "请传入 material 或在子类中实现 sample_episode()"
+            )
+
+        if T is None:
+            states, actions, contact_pairs = self.sample_trajectory()
+        else:
+            states, actions, contact_pairs = self.sample_trajectory(T=T)
+
+        # 尽量沿用旧 provider 的时间步；若未暴露，用 1.0 表示
+        # “每个样本一步”，避免猜测真实物理单位。
+        if macro_dt is None:
+            macro_dt = float(getattr(self, "macro_dt", getattr(self, "dt", 1.0)))
+
+        return DLOEpisode(
+            material=material,
+            states=states,
+            actions=actions,
+            contact_pairs=contact_pairs,
+            macro_dt=macro_dt,
+            task=task,
+            seed=seed,
+            id=episode_id,
+            metadata={} if metadata is None else dict(metadata),
+        ).validate()
 
     @property
     @abstractmethod
@@ -186,19 +233,100 @@ class SyntheticRope(TrajectoryProvider):
         return states, actions, contact_pairs
 
 
-def make_transition_batch(provider: TrajectoryProvider, n_traj=8, T=20):
+def slice_episode(episode: DLOEpisode, T: int | None = None) -> DLOEpisode:
+    """按转移数截断 episode，保留 T+1 帧状态和接触对。"""
+    episode.validate()
+    if T is None or T >= len(episode.actions):
+        return episode
+    if T < 0:
+        raise ValueError(f"T 必须非负，实际为 {T}")
+    sliced = replace(
+        episode,
+        states=episode.states[: T + 1],
+        actions=episode.actions[:T],
+        contact_pairs=episode.contact_pairs[: T + 1],
+    )
+    sliced.validate()
+    return sliced
+
+
+def episode_to_transitions(
+    episode: DLOEpisode,
+    T: int | None = None,
+) -> list[dict]:
+    """把一条 v2 episode 展开为单步监督样本。"""
+    episode = slice_episode(episode, T=T)
+    samples = []
+    for t, action in enumerate(episode.actions):
+        samples.append({
+            "state_t": episode.states[t],
+            "action_t": action,
+            "cpairs_t": episode.contact_pairs[t],
+            "state_tp1": episode.states[t + 1],
+            # 材料是 episode 级常量，每个 transition 只保留引用。
+            "material": episode.material,
+            "macro_dt": episode.macro_dt,
+            "episode_id": episode.episode_id,
+            "transition_index": t,
+        })
+    return samples
+
+
+def _legacy_trajectory_to_transitions(states, actions, contact_pairs):
+    """保留 v1 provider 的输出契约。"""
+    if len(states) != len(actions) + 1:
+        raise ValueError(
+            "v1 trajectory 必须满足 len(states)=len(actions)+1"
+        )
+    if len(contact_pairs) != len(states):
+        raise ValueError(
+            "v1 trajectory 的 contact_pairs 长度必须与 states 一致"
+        )
+    return [
+        {
+            "state_t": states[t],
+            "action_t": actions[t],
+            "cpairs_t": contact_pairs[t],
+            "state_tp1": states[t + 1],
+            "material": None,
+            "macro_dt": None,
+            "episode_id": "",
+            "transition_index": t,
+        }
+        for t in range(len(actions))
+    ]
+
+
+def make_transition_batch(
+    provider: TrajectoryProvider | DLOEpisode | Iterable[DLOEpisode],
+    n_traj=8,
+    T=20,
+):
     """
     把若干条轨迹拍平成单步转移样本，供监督训练。
     返回 list of dict，每个是一个 (state_t, action_t, state_{t+1}) 样本。
     """
+    # 便于训练/测试直接传入已加载的 episode。
+    if isinstance(provider, DLOEpisode):
+        return episode_to_transitions(provider, T=T)
+    if isinstance(provider, (list, tuple)) and all(
+        isinstance(item, DLOEpisode) for item in provider
+    ):
+        samples = []
+        for episode in provider:
+            samples.extend(episode_to_transitions(episode, T=T))
+        return samples
+
     samples = []
     for _ in range(n_traj):
-        states, actions, cpairs = provider.sample_trajectory(T=T)
-        for t in range(len(actions)):
-            samples.append({
-                "state_t": states[t],
-                "action_t": actions[t],
-                "cpairs_t": cpairs[t],
-                "state_tp1": states[t + 1],
-            })
+        try:
+            episode = provider.sample_episode(T=T)
+        except NotImplementedError:
+            # 只有 v1 trajectory 的 provider 继续走原路径。
+            states, actions, cpairs = provider.sample_trajectory(T=T)
+            samples.extend(
+                _legacy_trajectory_to_transitions(states, actions, cpairs)
+            )
+        else:
+            samples.extend(episode_to_transitions(episode))
     return samples

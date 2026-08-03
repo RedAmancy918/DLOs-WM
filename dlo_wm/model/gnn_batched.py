@@ -13,7 +13,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .gnn import mlp, InteractionLayer
+from .gnn import (
+    MATERIAL_INPUT_DIM,
+    ConditionedInteractionLayer,
+    InteractionLayer,
+    MaterialEncoder,
+    mlp,
+)
 from ..data.schema import (NODE_FEAT_DIM, EDGE_FEAT_DIM, POS_DIM,
                            compute_edge_features)
 from ..data.batch import segment_mean, BatchedGraph
@@ -55,6 +61,89 @@ class BatchedDLOWorldModel(nn.Module):
             "acc": acc, "pos_next": pos_next, "vel_next": vel_next,
             "tension": tension, "contact_logit": contact_logit,
             "topo_logits": topo_logits, "fail_logit": fail_logit,
+        }
+
+
+class BatchedMaterialConditionedDLOWorldModel(nn.Module):
+    """显式接收 [B, M] 材料条件的 disjoint 批图模型。"""
+
+    def __init__(self, hidden=256, n_message_passing=10,
+                 n_topo_classes=3, dt=0.04,
+                 material_input_dim=MATERIAL_INPUT_DIM):
+        super().__init__()
+        self.hidden = hidden
+        self.dt = dt
+        self.material_input_dim = material_input_dim
+
+        self.material_enc = MaterialEncoder(material_input_dim, hidden)
+        self.node_enc = mlp([NODE_FEAT_DIM + hidden, hidden, hidden])
+        self.edge_enc = mlp([EDGE_FEAT_DIM + hidden, hidden, hidden])
+        self.layers = nn.ModuleList(
+            [ConditionedInteractionLayer(hidden)
+             for _ in range(n_message_passing)]
+        )
+        self.acc_head = mlp([hidden, hidden, POS_DIM])
+        self.tension_head = mlp([hidden, hidden, 1])
+        self.contact_head = mlp([hidden, hidden, 1])
+        self.topo_head = mlp([hidden, hidden, n_topo_classes])
+        self.fail_head = mlp([hidden, hidden, 1])
+
+    def forward(self, bg: BatchedGraph, material_features):
+        """
+        material_features: [B, M]，第 b 行对应批图中的第 b 个 episode。
+
+        材料显式作为 forward 参数传入，不要求尚未迁移的数据层给
+        ``BatchedGraph`` 增加字段。
+        """
+        if material_features.ndim != 2:
+            raise ValueError(
+                "批图 material_features 必须是 [B, M]，"
+                f"实际 shape={tuple(material_features.shape)}"
+            )
+        if material_features.shape[0] != bg.num_graphs:
+            raise ValueError(
+                f"材料 batch 大小应为 {bg.num_graphs}，"
+                f"实际为 {material_features.shape[0]}"
+            )
+        material_features = material_features.to(
+            device=bg.pos.device, dtype=bg.pos.dtype
+        )
+        material_graph = self.material_enc(material_features)  # [B, hidden]
+        material_node = material_graph[bg.batch_idx]           # [sumN, hidden]
+        material_edge = material_node[bg.edge_index[0]]        # [sumE, hidden]
+
+        e_feat = compute_edge_features(
+            bg.pos, bg.edge_index, bg.is_contact
+        )
+        h = self.node_enc(
+            torch.cat([bg.node_feat, material_node], dim=-1)
+        )
+        e = self.edge_enc(
+            torch.cat([e_feat, material_edge], dim=-1)
+        )
+        for layer in self.layers:
+            h, e = layer(
+                h, e, bg.edge_index, bg.drive, material_node
+            )
+
+        acc = self.acc_head(h)
+        tension = F.softplus(self.tension_head(h)).squeeze(-1)
+        contact_logit = self.contact_head(h).squeeze(-1)
+
+        g = segment_mean(h, bg.batch_idx, bg.num_graphs)
+        topo_logits = self.topo_head(g)
+        fail_logit = self.fail_head(g).squeeze(-1)
+
+        vel_next = bg.vel + self.dt * acc
+        pos_next = bg.pos + self.dt * vel_next
+        return {
+            "acc": acc,
+            "pos_next": pos_next,
+            "vel_next": vel_next,
+            "tension": tension,
+            "contact_logit": contact_logit,
+            "topo_logits": topo_logits,
+            "fail_logit": fail_logit,
         }
 
 
